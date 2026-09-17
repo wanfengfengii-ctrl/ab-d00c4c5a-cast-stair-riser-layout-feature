@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.logic import (
     MAX_STEPS,
     MIN_STEPS,
+    InvalidControlPointError,
     InvalidSelectionError,
     LayoutParams,
     compute_layout,
@@ -235,3 +236,185 @@ def test_infeasible_selection_rejected_with_constraint_reason():
 def test_selection_rejected_when_no_solution():
     with pytest.raises(InvalidSelectionError):
         compute_layout(make(riser_min_mm=170, riser_max_mm=172), selected_steps=17)
+
+
+# ---------------------------------------------------------------------------
+# 中间标高控制点
+# ---------------------------------------------------------------------------
+
+
+def test_no_control_points_response_identical_to_before():
+    # 不带控制点（含显式空列表）：序列与无控制点方案完全一致，且不出现受控字段
+    plain = compute_layout(make())
+    empty = compute_layout(make(), control_points=[])
+    assert empty == plain
+    sol = plain["solution"]
+    assert "controlled" not in sol and "control_points" not in sol
+    assert sol["riser_sequence_mm"] == [177] * 8 + [176] * 9
+
+
+def test_two_control_points_recommended_layout_hit_exactly():
+    # 自动推荐 17 级方案 + 双控制点（6 级 1057mm、12 级 2117mm）
+    result = compute_layout(
+        make(),
+        control_points=[{"step": 6, "elevation_mm": 1057},
+                        {"step": 12, "elevation_mm": 2117}],
+    )
+    assert result["status"] == "ok"
+    assert result["recommended_steps"] == 17
+    assert result["selection_source"] == "auto"
+    sol = result["solution"]
+    # 推荐、选用与候选标记不因控制点改变
+    by_steps = {c["steps"]: c for c in result["candidates"]}
+    assert by_steps[17]["recommended"] and by_steps[17]["selected"]
+    assert sol["controlled"] is True
+    # 控制点精确命中，层高终点精确闭合
+    assert sol["cumulative_height_mm"][5] == 1057
+    assert sol["cumulative_height_mm"][11] == 2117
+    assert sol["cumulative_height_mm"][-1] == 3000
+    assert sol["total_height_mm"] == 3000
+    assert sol["control_points"] == [
+        {"step": 6, "elevation_mm": 1057},
+        {"step": 12, "elevation_mm": 2117},
+    ]
+    # 结果按级号唯一确定：与分段公式独立算出的逐级高度完全一致
+    assert sol["riser_sequence_mm"] == [
+        176.5, 176, 176, 176.5, 176, 176,      # 起点 → 6 级 1057
+        177, 176.5, 176.5, 177, 176.5, 176.5,  # 6 级 → 12 级 2117
+        177, 176.5, 176.5, 176.5, 176.5,       # 12 级 → 17 级 3000
+    ]
+    # 每级高度均在原闭区间内
+    assert all(150 <= h <= 190 for h in sol["riser_sequence_mm"])
+    # 段内累计值相对理想直线误差不超过 0.5mm（按半毫米向上取整）
+    anchors = [(0, 0), (6, 1057), (12, 2117), (17, 3000)]
+    for (a, ae), (b, be) in zip(anchors, anchors[1:]):
+        for j in range(1, b - a + 1):
+            ideal = ae + (be - ae) * j / (b - a)
+            actual = sol["cumulative_height_mm"][a + j - 1]
+            assert abs(actual - ideal) <= 0.5 + 1e-9
+
+
+def test_half_mm_rounding_marks_and_sums():
+    # 18 级方案、9 级控制点 1500mm：各段出现 166.5/167mm，总和仍精确闭合
+    result = compute_layout(
+        make(), selected_steps=18,
+        control_points=[{"step": 9, "elevation_mm": 1500}],
+    )
+    sol = result["solution"]
+    assert result["selection_source"] == "manual"
+    assert result["recommended_steps"] == 17
+    assert sol["steps"] == 18
+    assert sol["cumulative_height_mm"][8] == 1500
+    assert sol["cumulative_height_mm"][-1] == 3000
+    assert sum(sol["riser_sequence_mm"]) == 3000
+    # 所有高度都是整毫米或半毫米
+    assert all(abs(h * 2 - round(h * 2)) < 1e-9 for h in sol["riser_sequence_mm"])
+    assert all(150 <= h <= 190 for h in sol["riser_sequence_mm"])
+
+
+def test_manual_selection_control_points_keep_marks():
+    # 人工选用 + 控制点：推荐标记仍在 17 级，选中在 18 级，受控标识随方案
+    result = compute_layout(
+        make(), selected_steps=18,
+        control_points=[{"step": 9, "elevation_mm": 1500}],
+    )
+    by_steps = {c["steps"]: c for c in result["candidates"]}
+    assert by_steps[17]["recommended"] is True and by_steps[17]["selected"] is False
+    assert by_steps[18]["recommended"] is False and by_steps[18]["selected"] is True
+    assert result["solution"]["controlled"] is True
+
+
+def test_control_point_result_is_deterministic():
+    # 同输入重复计算：逐级表按级号唯一确定，与调用次数无关
+    cps = [{"step": 6, "elevation_mm": 1057}, {"step": 12, "elevation_mm": 2117}]
+    r1 = compute_layout(make(), control_points=cps)
+    r2 = compute_layout(make(), control_points=[dict(p) for p in cps])
+    assert r1["solution"]["riser_sequence_mm"] == r2["solution"]["riser_sequence_mm"]
+    assert r1["solution"]["cumulative_height_mm"] == r2["solution"]["cumulative_height_mm"]
+
+
+@pytest.mark.parametrize("bad_step", [0, 17, 40, -1])
+def test_control_point_step_outside_first_last_rejected(bad_step):
+    with pytest.raises(InvalidControlPointError) as exc:
+        compute_layout(make(), control_points=[{"step": bad_step, "elevation_mm": 1000}])
+    assert exc.value.field == "step"
+    assert exc.value.index == 0
+    assert str(bad_step) in exc.value.message
+
+
+def test_control_points_must_be_strictly_increasing_in_step():
+    with pytest.raises(InvalidControlPointError) as exc:
+        compute_layout(
+            make(),
+            control_points=[{"step": 10, "elevation_mm": 1700},
+                            {"step": 10, "elevation_mm": 1800}],
+        )
+    assert exc.value.loc == (1, "step")
+
+
+def test_control_points_must_be_strictly_increasing_in_elevation():
+    with pytest.raises(InvalidControlPointError) as exc:
+        compute_layout(
+            make(),
+            control_points=[{"step": 6, "elevation_mm": 1057},
+                            {"step": 12, "elevation_mm": 1057}],
+        )
+    assert exc.value.loc == (1, "elevation_mm")
+
+
+@pytest.mark.parametrize("bad_elevation", [0, 3000, 3100])
+def test_control_point_elevation_outside_range_rejected(bad_elevation):
+    with pytest.raises(InvalidControlPointError) as exc:
+        compute_layout(make(), control_points=[{"step": 6, "elevation_mm": bad_elevation}])
+    assert exc.value.field == "elevation_mm"
+    assert str(bad_elevation) in exc.value.message
+
+
+def test_control_point_causing_riser_below_minimum_rejected_with_owner():
+    # 区间收紧为 [176,177]：6 级 1000mm 使第 1 段首段均高约 166.7，越下限
+    params = make(riser_min_mm=176, riser_max_mm=177, target_riser_mm=176)
+    with pytest.raises(InvalidControlPointError) as exc:
+        compute_layout(params, control_points=[{"step": 6, "elevation_mm": 1000}])
+    err = exc.value
+    assert err.loc == (0, "elevation_mm")
+    assert "控制点 6" in err.message
+    assert "167" in err.message and "低于下限" in err.message
+    assert "176" in err.message and "177" in err.message
+
+
+def test_control_point_causing_riser_above_maximum_rejected_with_owner():
+    # 双控制点中第二个点（12 级 2200mm）使其前段（7–12 级）均高约 190.5，越上限；
+    # 错误必须定位到第 2 个控制点（下标 1），并给出越界级与计算高度
+    with pytest.raises(InvalidControlPointError) as exc:
+        compute_layout(
+            make(),
+            control_points=[{"step": 6, "elevation_mm": 1057},
+                            {"step": 12, "elevation_mm": 2200}],
+        )
+    err = exc.value
+    assert err.loc == (1, "elevation_mm")
+    assert "控制点 12" in err.message
+    assert "第 7 级" in err.message and "190.5" in err.message
+    assert "高于上限" in err.message and "190" in err.message
+
+
+def test_last_segment_violation_attributed_to_last_control_point():
+    # 末段（12 级之后）过低：12 级 2950mm，剩余 50mm/5 级 = 10mm，越下限
+    with pytest.raises(InvalidControlPointError) as exc:
+        compute_layout(
+            make(),
+            control_points=[{"step": 6, "elevation_mm": 1057},
+                            {"step": 12, "elevation_mm": 2950}],
+        )
+    assert exc.value.loc == (1, "elevation_mm")
+    assert "控制点 12" in exc.value.message
+
+
+def test_control_points_with_no_solution_keep_no_solution():
+    # 无解行为保持现状：即使携带控制点也返回 no_solution
+    result = compute_layout(
+        make(riser_min_mm=170, riser_max_mm=172),
+        control_points=[{"step": 6, "elevation_mm": 1000}],
+    )
+    assert result["status"] == "no_solution"
+    assert result["solution"] is None

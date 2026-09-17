@@ -196,3 +196,126 @@ def test_no_solution_response_shape_unchanged():
     assert data["solution"] is None
     assert data["recommended_steps"] is None
     assert data["selection_source"] is None
+
+
+# ---------------------------------------------------------------------------
+# 中间标高控制点
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_request_without_control_points_unchanged():
+    """旧请求兼容：不带控制点时响应不含受控字段，余数前置序列完全不变。"""
+    data = post(BASE).json()
+    sol = data["solution"]
+    assert "controlled" not in sol
+    assert "control_points" not in sol
+    assert sol["riser_sequence_mm"] == [177] * 8 + [176] * 9
+    assert sol["cumulative_height_mm"][-1] == 3000
+    # 显式空列表等价于缺省
+    data_empty = post({**BASE, "control_points": []}).json()
+    assert data_empty["solution"]["riser_sequence_mm"] == sol["riser_sequence_mm"]
+    assert "controlled" not in data_empty["solution"]
+
+
+def test_recommended_layout_two_control_points_hit_exactly():
+    """推荐方案 + 双控制点：分段重算逐级表，控制点精确命中、误差不超 0.5mm。"""
+    cps = [{"step": 6, "elevation_mm": 1057}, {"step": 12, "elevation_mm": 2117}]
+    r = post({**BASE, "control_points": cps})
+    assert r.status_code == 200
+    data = r.json()
+    # 推荐链路与候选标记保留
+    assert data["recommended_steps"] == 17
+    assert data["selection_source"] == "auto"
+    sol = data["solution"]
+    assert sol["steps"] == 17
+    assert sol["controlled"] is True
+    assert sol["control_points"] == cps
+    by_steps = {c["steps"]: c for c in data["candidates"]}
+    assert by_steps[17]["recommended"] is True and by_steps[17]["selected"] is True
+    # 精确命中与终点闭合
+    cum = sol["cumulative_height_mm"]
+    assert cum[5] == 1057 and cum[11] == 2117 and cum[-1] == 3000
+    assert sol["total_height_mm"] == 3000
+    # 每级高度落入原闭区间，且为整毫米或半毫米
+    assert all(150 <= h <= 190 for h in sol["riser_sequence_mm"])
+    assert all(abs(h * 2 - round(h * 2)) < 1e-9 for h in sol["riser_sequence_mm"])
+    # 段内任一累计值相对理想直线误差不超过 0.5mm
+    anchors = [(0, 0), (6, 1057), (12, 2117), (17, 3000)]
+    for (a, ae), (b, be) in zip(anchors, anchors[1:]):
+        for j in range(1, b - a + 1):
+            ideal = ae + (be - ae) * j / (b - a)
+            assert abs(cum[a + j - 1] - ideal) <= 0.5 + 1e-9
+
+
+def test_manual_selection_with_control_point_hits_exactly():
+    """人工方案（18 级）应用控制点后精确命中，推荐标识仍保留。"""
+    r = post({
+        **BASE,
+        "selected_steps": 18,
+        "control_points": [{"step": 9, "elevation_mm": 1500}],
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["selection_source"] == "manual"
+    assert data["recommended_steps"] == 17
+    sol = data["solution"]
+    assert sol["steps"] == 18 and sol["controlled"] is True
+    assert sol["cumulative_height_mm"][8] == 1500
+    assert sol["cumulative_height_mm"][-1] == 3000
+    assert sum(sol["riser_sequence_mm"]) == 3000
+    assert all(150 <= h <= 190 for h in sol["riser_sequence_mm"])
+    by_steps = {c["steps"]: c for c in data["candidates"]}
+    assert by_steps[17]["recommended"] is True and by_steps[18]["selected"] is True
+
+
+def test_control_point_riser_out_of_interval_returns_field_feedback():
+    """控制点导致单级高度越界：422 定位到具体控制点，并说明越界级与计算高度。"""
+    cps = [
+        {"step": 6, "elevation_mm": 1057},
+        {"step": 12, "elevation_mm": 2200},  # 7–12 级均高 ≈190.5 > 190
+    ]
+    r = post({**BASE, "control_points": cps})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert ["body", "control_points", 1, "elevation_mm"] in [e["loc"] for e in detail]
+    msg = next(e["msg"] for e in detail if e["loc"][-1] == "elevation_mm")
+    assert "控制点 12" in msg
+    assert "第 7 级" in msg
+    assert "190.5" in msg and "高于上限" in msg
+    assert "[150, 190]" in msg
+
+
+def test_control_point_invalid_step_returns_422_located_at_point():
+    r = post({**BASE, "control_points": [{"step": 17, "elevation_mm": 2900}]})
+    assert r.status_code == 422
+    locs = [tuple(e["loc"]) for e in r.json()["detail"]]
+    assert ("body", "control_points", 0, "step") in locs
+
+
+@pytest.mark.parametrize("bad", [
+    [{"step": 6, "elevation_mm": 1057}, {"step": 5, "elevation_mm": 1100}],   # 级号倒序
+    [{"step": 6, "elevation_mm": 1057}, {"step": 12, "elevation_mm": 1057}],  # 标高不递增
+    [{"step": 0, "elevation_mm": 100}],                                        # 级号越界
+    [{"step": 6, "elevation_mm": 0}],                                          # 标高在起点
+    [{"step": 6, "elevation_mm": 3000}],                                       # 标高在终点
+])
+def test_control_points_invalid_relations_return_422(bad):
+    assert post({**BASE, "control_points": bad}).status_code == 422
+
+
+def test_control_points_wrong_type_returns_422():
+    assert post({**BASE, "control_points": [{"step": "6", "elevation_mm": 1057}]}).status_code == 422
+    assert post({**BASE, "control_points": [{"step": 6, "elevation_mm": 1057.5}]}).status_code == 422
+    assert post({**BASE, "control_points": "not-a-list"}).status_code == 422
+
+
+def test_no_solution_with_control_points_unchanged():
+    """无解行为保持现状：携带控制点仍返回 no_solution。"""
+    data = post({
+        **BASE,
+        "riser_min_mm": 170,
+        "riser_max_mm": 172,
+        "control_points": [{"step": 6, "elevation_mm": 1000}],
+    }).json()
+    assert data["status"] == "no_solution"
+    assert data["solution"] is None
