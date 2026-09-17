@@ -1,0 +1,43 @@
+name: stair-layout
+
+services:
+  api:
+    build: ./api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  web:
+    build: ./web
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # 只校验 web 自身（nginx 静态服务）；代理链路由 verify 的 e2e 验收覆盖
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # 一次性验收服务：真实浏览器经 Web 代理跑通主链路后退出
+  verify:
+    build:
+      context: .
+      dockerfile: verify/Dockerfile
+    profiles: ["verify"]
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    environment:
+      WEB_BASE_URL: http://web
+      API_BASE_URL: http://api:8000
