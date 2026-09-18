@@ -248,3 +248,159 @@ def test_boundary_and_rounding_display(page):
     expect(page.get_by_test_id("step-count")).to_have_text("20")
     # 4808/19 ≈ 253.05 → 四舍五入显示 253
     expect(page.get_by_test_id("tread-display")).to_have_text("253 mm")
+
+
+# ---------------------------------------------------------------------------
+# 中间标高控制点
+# ---------------------------------------------------------------------------
+
+def riser_cum_cell(page, row):
+    return page.get_by_test_id(f"riser-row-{row}").locator("td").nth(2)
+
+
+def fill_cp_row(page, index, step, elev):
+    page.get_by_test_id(f"cp-step-{index}").fill(str(step))
+    page.get_by_test_id(f"cp-elev-{index}").fill(str(elev))
+
+
+def test_recommended_layout_with_two_control_points_hits_exactly(page):
+    """推荐方案录入双控制点后重新生成逐级表：受控标识、精确命中、候选标记保留。"""
+    page.goto(WEB)
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+    expect(page.get_by_test_id("controlled-badge")).to_have_count(0)
+
+    fill_cp_row(page, 0, 5, 900)
+    page.get_by_test_id("cp-add").click()
+    fill_cp_row(page, 1, 10, 1750)
+    page.get_by_test_id("cp-apply").click()
+
+    # 受控标识出现，仍为自动推荐的 17 级
+    expect(page.get_by_test_id("controlled-badge")).to_be_visible()
+    expect(page.get_by_test_id("controlled-badge")).to_have_text("控制点受控")
+    expect(page.get_by_test_id("selection-source")).to_have_text("自动推荐")
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+    # 控制点与层高终点精确命中
+    expect(riser_cum_cell(page, 5)).to_have_text("900")
+    expect(riser_cum_cell(page, 10)).to_have_text("1750")
+    expect(riser_cum_cell(page, 17)).to_have_text("3000")
+    # 命中值回显
+    expect(page.get_by_test_id("cp-hits")).to_be_visible()
+    expect(page.get_by_test_id("cp-hit-value-0")).to_have_text("900")
+    expect(page.get_by_test_id("cp-hit-value-1")).to_have_text("1750")
+    # 受控级在逐级表中有标记
+    expect(page.get_by_test_id("cp-marker-5")).to_have_count(1)
+    expect(page.get_by_test_id("cp-marker-10")).to_have_count(1)
+    # 推荐、选中与候选按钮标记保留
+    expect(page.get_by_test_id("candidate-row-17")).to_contain_text("选中")
+    expect(page.get_by_test_id("candidate-recommended")).to_have_count(1)
+    expect(page.get_by_test_id("adopt-18")).to_be_visible()
+    # 逐级表仍为 17 行
+    expect(page.locator('[data-testid^="riser-row-"]')).to_have_count(17)
+
+
+def test_manual_layout_with_control_point_hits_exactly(page):
+    """人工改选后录入控制点：人工标识与推荐标记保留，控制点精确命中。"""
+    page.goto(WEB)
+    page.get_by_test_id("adopt-18").click()
+    expect(page.get_by_test_id("step-count")).to_have_text("18")
+    expect(page.get_by_test_id("selection-source")).to_have_text("人工选用")
+
+    fill_cp_row(page, 0, 9, 1500)
+    page.get_by_test_id("cp-apply").click()
+
+    # 人工选用 + 控制点受控标识并存
+    expect(page.get_by_test_id("controlled-badge")).to_be_visible()
+    expect(page.get_by_test_id("selection-source")).to_have_text("人工选用")
+    expect(page.get_by_test_id("recommended-steps")).to_have_text("17")
+    expect(page.get_by_test_id("step-count")).to_have_text("18")
+    # 第 9 级精确命中 1500，终点仍为 3000，共 18 行
+    expect(riser_cum_cell(page, 9)).to_have_text("1500")
+    expect(riser_cum_cell(page, 18)).to_have_text("3000")
+    expect(page.locator('[data-testid^="riser-row-"]')).to_have_count(18)
+    expect(page.get_by_test_id("cp-hit-value-0")).to_have_text("1500")
+    # 候选标记：18 选中、17 保留自动推荐
+    expect(page.get_by_test_id("candidate-row-18")).to_contain_text("选中")
+    expect(page.get_by_test_id("candidate-row-17")).to_contain_text("自动推荐")
+
+
+def test_control_point_out_of_bounds_shows_field_feedback_and_keeps_layout(page):
+    """控制点使单级高度越界：字段级反馈、保留原方案。"""
+    page.goto(WEB)
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+
+    # 第 1 级累计 140 → 单级高度 140mm 低于下限 150mm
+    fill_cp_row(page, 0, 1, 140)
+    page.get_by_test_id("cp-apply").click()
+
+    # 错误定位到第 1 行“累计标高”字段，含越界级与计算高度
+    expect(page.get_by_test_id("cp-elev-0-error")).to_be_visible()
+    expect(page.get_by_test_id("cp-elev-0-error")).to_contain_text("第 1 级")
+    expect(page.get_by_test_id("cp-elev-0-error")).to_contain_text("140")
+    expect(page.get_by_test_id("cp-error")).to_be_visible()
+    # 未受控：原 17 级余数前置方案保留
+    expect(page.get_by_test_id("controlled-badge")).to_have_count(0)
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+    expect(page.locator('[data-testid^="riser-row-"]')).to_have_count(17)
+    # 原余数前置序列不变（前 8 级 177）
+    expect(riser_cell(page, 1)).to_have_text("177")
+
+    # 改为合法控制点后可成功应用
+    page.get_by_test_id("cp-step-0").fill("5")
+    page.get_by_test_id("cp-elev-0").fill("900")
+    page.get_by_test_id("cp-apply").click()
+    expect(page.get_by_test_id("controlled-badge")).to_be_visible()
+    expect(riser_cum_cell(page, 5)).to_have_text("900")
+    expect(page.get_by_test_id("cp-error")).to_have_count(0)
+    expect(page.get_by_test_id("cp-elev-0-error")).to_have_count(0)
+
+
+def test_changing_steps_or_dimension_clears_control_points(page):
+    """改选踏步数或修改尺寸：清空控制点并按原链路计算。"""
+    page.goto(WEB)
+    fill_cp_row(page, 0, 5, 900)
+    page.get_by_test_id("cp-add").click()
+    fill_cp_row(page, 1, 10, 1750)
+    page.get_by_test_id("cp-apply").click()
+    expect(page.get_by_test_id("controlled-badge")).to_be_visible()
+    expect(riser_cum_cell(page, 5)).to_have_text("900")
+
+    # 改选踏步数：控制点录入与受控状态一并清空
+    page.get_by_test_id("adopt-18").click()
+    expect(page.get_by_test_id("step-count")).to_have_text("18")
+    expect(page.get_by_test_id("controlled-badge")).to_have_count(0)
+    expect(page.get_by_test_id("cp-hits")).to_have_count(0)
+    expect(page.get_by_test_id("cp-step-0")).to_have_value("")
+    expect(page.get_by_test_id("cp-elev-0")).to_have_value("")
+    # 18 级原余数前置序列恢复：前 12 级 167
+    expect(riser_cell(page, 1)).to_have_text("167")
+
+    # 在人工方案上再次应用控制点
+    fill_cp_row(page, 0, 9, 1500)
+    page.get_by_test_id("cp-apply").click()
+    expect(page.get_by_test_id("controlled-badge")).to_be_visible()
+    expect(riser_cum_cell(page, 9)).to_have_text("1500")
+
+    # 修改尺寸：清空人工选用与控制点，恢复自动推荐原链路
+    page.get_by_test_id("tread-max").fill("330")
+    expect(page.get_by_test_id("step-count")).to_have_text("17")
+    expect(page.get_by_test_id("selection-source")).to_have_text("自动推荐")
+    expect(page.get_by_test_id("controlled-badge")).to_have_count(0)
+    expect(page.get_by_test_id("cp-hits")).to_have_count(0)
+    # 余数前置序列恢复：前 8 级 177
+    expect(riser_cell(page, 1)).to_have_text("177")
+    expect(riser_cum_cell(page, 5)).to_have_text("885")  # 5×177
+
+
+def test_control_point_client_form_validation(page):
+    """级号/标高结构错误在客户端即时拦截，不进入受控状态。"""
+    page.goto(WEB)
+    fill_cp_row(page, 0, 17, 2900)  # 17 级方案仅允许 1–16 级
+    page.get_by_test_id("cp-apply").click()
+    expect(page.get_by_test_id("cp-step-0-error")).to_contain_text("16")
+    expect(page.get_by_test_id("controlled-badge")).to_have_count(0)
+
+    page.get_by_test_id("cp-step-0").fill("5")
+    page.get_by_test_id("cp-elev-0").fill("3000")  # 标高不得等于层高终点
+    page.get_by_test_id("cp-apply").click()
+    expect(page.get_by_test_id("cp-elev-0-error")).to_contain_text("3000")
+    expect(page.get_by_test_id("controlled-badge")).to_have_count(0)

@@ -9,7 +9,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.logic import (
     MAX_STEPS,
     MIN_STEPS,
+    ControlPointError,
     InvalidSelectionError,
+    LayoutControlPoint,
     LayoutParams,
     compute_layout,
 )
@@ -235,3 +237,179 @@ def test_infeasible_selection_rejected_with_constraint_reason():
 def test_selection_rejected_when_no_solution():
     with pytest.raises(InvalidSelectionError):
         compute_layout(make(riser_min_mm=170, riser_max_mm=172), selected_steps=17)
+
+
+# ---------------------------------------------------------------------------
+# 中间标高控制点
+# ---------------------------------------------------------------------------
+
+def cp(step, elev):
+    return LayoutControlPoint(step=step, cumulative_mm=elev)
+
+
+def test_legacy_response_identical_without_control_points():
+    """旧请求不带控制点：逐级序列与响应结构完全不变。"""
+    result = compute_layout(make())
+    sol = result["solution"]
+    assert "controlled" not in sol
+    assert "control_points" not in sol
+    assert sol["riser_sequence_mm"] == [177] * 8 + [176] * 9
+    assert sol["cumulative_height_mm"] == _legacy_cumulative(17, [177] * 8 + [176] * 9)
+
+
+def _legacy_cumulative(steps, seq):
+    out, total = [], 0
+    for h in seq:
+        total += h
+        out.append(total)
+    return out
+
+
+def test_auto_recommendation_with_two_control_points():
+    """推荐方案（17 级）+ 双控制点：分段取整、精确命中、0.5mm 线性误差界限。"""
+    points = [cp(5, 900), cp(10, 1750)]
+    result = compute_layout(make(), control_points=points)
+    assert result["status"] == "ok"
+    assert result["selection_source"] == "auto"
+    assert result["recommended_steps"] == 17
+    sol = result["solution"]
+    assert sol["controlled"] is True
+    assert sol["steps"] == 17
+    seq, cumulative = sol["riser_sequence_mm"], sol["cumulative_height_mm"]
+    # 控制点与层高终点精确命中
+    assert cumulative[4] == 900
+    assert cumulative[9] == 1750
+    assert cumulative[-1] == 3000
+    assert sol["total_height_mm"] == 3000
+    # 命中信息
+    assert sol["control_points"] == [
+        {"step": 5, "requested_mm": 900, "hit_mm": 900, "error_mm": 0},
+        {"step": 10, "requested_mm": 1750, "hit_mm": 1750, "error_mm": 0},
+    ]
+    # 每级高度落入原高度闭区间 [150,190]
+    assert all(150 <= h <= 190 for h in seq)
+    # 段内累计相对理想直线的误差位于 [0, 0.5mm)
+    anchors = [(0, 0), (5, 900), (10, 1750), (17, 3000)]
+    for (a, ea), (b, eb) in zip(anchors, anchors[1:]):
+        m, delta = b - a, eb - ea
+        for j in range(1, m + 1):
+            observed = cumulative[a + j - 1] - ea
+            ideal = j * delta / m
+            assert 0 <= observed - ideal < 0.5, (a, j, observed, ideal)
+
+
+def test_manual_selection_with_control_point_hits_exactly():
+    """人工方案应用控制点后精确命中。"""
+    result = compute_layout(make(), selected_steps=18,
+                            control_points=[cp(9, 1500)])
+    assert result["selection_source"] == "manual"
+    assert result["recommended_steps"] == 17  # 推荐标识保留
+    sol = result["solution"]
+    assert sol["controlled"] is True
+    assert sol["steps"] == 18
+    assert sol["cumulative_height_mm"][8] == 1500
+    assert sol["cumulative_height_mm"][-1] == 3000
+    assert sol["control_points"][0]["hit_mm"] == 1500
+    assert sol["control_points"][0]["error_mm"] == 0
+    by_steps = {c["steps"]: c for c in result["candidates"]}
+    assert by_steps[17]["recommended"] is True
+    assert by_steps[18]["selected"] is True
+
+
+def test_control_point_can_rewrite_remainder_prefix_sequence():
+    """受控序列由控制点唯一确定，可与原余数前置序列不同（半毫米网格）。"""
+    # 单控制点：第 8 级命中 1400；原余数序列第 8 级为 8*177=1416
+    result = compute_layout(make(), control_points=[cp(8, 1400)])
+    sol = result["solution"]
+    assert sol["cumulative_height_mm"][7] == 1400
+    assert sol["cumulative_height_mm"][-1] == 3000
+    # 后段 1600/9 ≈ 177.78 → 半毫米向上取整出现 x.5 值
+    assert any(isinstance(h, float) for h in sol["riser_sequence_mm"])
+    assert all(150 <= h <= 190 for h in sol["riser_sequence_mm"])
+
+
+def test_result_unique_for_same_control_points():
+    """同一组控制点结果按级号唯一确定：重复请求序列一致。"""
+    points = [cp(3, 540), cp(12, 2110)]
+    first = compute_layout(make(), control_points=points)["solution"]
+    second = compute_layout(make(), control_points=points)["solution"]
+    assert first["riser_sequence_mm"] == second["riser_sequence_mm"]
+    assert first["cumulative_height_mm"] == second["cumulative_height_mm"]
+
+
+def test_empty_control_point_list_is_legacy():
+    sol = compute_layout(make(), control_points=[])["solution"]
+    assert "controlled" not in sol
+    assert sol["riser_sequence_mm"] == [177] * 8 + [176] * 9
+
+
+def test_out_of_bounds_riser_under_control_points_raises_localized():
+    """控制点导致单级高度低于下限：错误定位到具体控制点，含越界级与计算高度。"""
+    with pytest.raises(ControlPointError) as exc:
+        # 17 级、第 1 级累计 140 → 第 1 级高度 140 < 150
+        compute_layout(make(), control_points=[cp(1, 140)])
+    e = exc.value
+    assert e.index == 0 and e.field == "cumulative_mm"
+    assert "第 1 级" in e.message and "140mm" in e.message and "150mm" in e.message
+
+
+def test_out_of_bounds_riser_in_middle_segment_localized_to_anchor():
+    """中间段越界定位到段末控制点；消息含越界级与计算高度。"""
+    with pytest.raises(ControlPointError) as exc:
+        # 两个控制点：第 5 级 900（段均 180 可行），第 10 级仅 1000
+        # → 6..10 级段高差 100，每级 20mm < 150
+        compute_layout(make(), control_points=[cp(5, 900), cp(10, 1000)])
+    e = exc.value
+    assert e.index == 1 and e.field == "cumulative_mm"
+    assert "第 6 级" in e.message and "20mm" in e.message
+
+
+def test_out_of_bounds_riser_in_last_segment_localized_to_last_cp():
+    """最后一段（终点为层高）越界改定位到最后一个控制点。"""
+    with pytest.raises(ControlPointError) as exc:
+        # 17 级：第 16 级 2800（前段均 175 可行）→ 第 17 级高度 3000-2800=200 > 190
+        compute_layout(make(), control_points=[cp(16, 2800)])
+    e = exc.value
+    assert e.index == 0 and e.field == "cumulative_mm"
+    assert "第 17 级" in e.message and "200mm" in e.message
+
+
+def test_control_point_step_must_lie_between_first_and_last():
+    with pytest.raises(ControlPointError) as exc:
+        compute_layout(make(), control_points=[cp(17, 2900)])  # 等于末级
+    assert exc.value.field == "step" and exc.value.index == 0
+    with pytest.raises(ControlPointError) as exc:
+        compute_layout(make(), control_points=[cp(0, 100)])
+    assert exc.value.field == "step"
+
+
+def test_control_point_elev_must_lie_between_anchors():
+    for bad_elev in (0, 3000, -5):
+        with pytest.raises(ControlPointError) as exc:
+            compute_layout(make(), control_points=[cp(5, bad_elev)])
+        assert exc.value.field == "cumulative_mm" and exc.value.index == 0
+
+
+def test_control_points_must_be_strictly_increasing_in_submission_order():
+    with pytest.raises(ControlPointError) as exc:
+        compute_layout(make(), control_points=[cp(10, 1750), cp(5, 900)])
+    assert exc.value.index == 1 and exc.value.field == "step"
+    with pytest.raises(ControlPointError) as exc:
+        compute_layout(make(), control_points=[cp(5, 900), cp(6, 900)])
+    assert exc.value.index == 1 and exc.value.field == "cumulative_mm"
+    with pytest.raises(ControlPointError) as exc:
+        compute_layout(make(), control_points=[cp(5, 900), cp(5, 950)])
+    assert exc.value.field == "step"
+
+
+def test_control_points_validated_against_chosen_steps():
+    """控制点级号区间随选定踏步数：18 级方案允许第 17 级控制点。"""
+    result = compute_layout(make(), selected_steps=18,
+                            control_points=[cp(17, 2850)])
+    assert result["solution"]["cumulative_height_mm"][16] == 2850
+
+
+def test_selected_steps_checked_before_control_points():
+    with pytest.raises(InvalidSelectionError):
+        compute_layout(make(), selected_steps=99,
+                       control_points=[cp(1, 140)])
